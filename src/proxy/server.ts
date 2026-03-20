@@ -138,7 +138,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         : conversationParts
 
         if (!stream) {
-          let fullContent = ""
+          const contentBlocks: Array<Record<string, unknown>> = []
           let assistantMessages = 0
           const upstreamStartAt = Date.now()
           let firstChunkAt: number | undefined
@@ -172,10 +172,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   })
                 }
 
+                // Preserve ALL content blocks (text, tool_use, thinking, etc.)
                 for (const block of message.message.content) {
-                  if (block.type === "text") {
-                    fullContent += block.text
-                  }
+                  contentBlocks.push(block as Record<string, unknown>)
                 }
               }
             }
@@ -196,28 +195,34 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             throw error
           }
 
-          // If no text content was produced (e.g. only tool_use), return a fallback
-          const fallbackUsed = !fullContent
-          if (fallbackUsed) {
-            fullContent = "I can help with that. Could you provide more details about what you'd like me to do?"
-            claudeLog("response.fallback_used", { mode: "non_stream", reason: "no_text_content" })
+          // Determine stop_reason based on content: tool_use if any tool blocks, else end_turn
+          const hasToolUse = contentBlocks.some((b) => b.type === "tool_use")
+          const stopReason = hasToolUse ? "tool_use" : "end_turn"
+
+          // If no content at all, add a fallback text block
+          if (contentBlocks.length === 0) {
+            contentBlocks.push({
+              type: "text",
+              text: "I can help with that. Could you provide more details about what you'd like me to do?"
+            })
+            claudeLog("response.fallback_used", { mode: "non_stream", reason: "no_content_blocks" })
           }
 
           claudeLog("response.completed", {
             mode: "non_stream",
             model,
             durationMs: Date.now() - requestStartAt,
-            responseChars: fullContent.length,
-            fallbackUsed
+            contentBlocks: contentBlocks.length,
+            hasToolUse
           })
 
           return c.json({
             id: `msg_${Date.now()}`,
             type: "message",
             role: "assistant",
-            content: [{ type: "text", text: fullContent }],
+            content: contentBlocks,
             model: body.model,
-            stop_reason: "end_turn",
+            stop_reason: stopReason,
             usage: { input_tokens: 0, output_tokens: 0 }
           })
         }
@@ -293,8 +298,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 }
               }, 15_000)
 
-              const skipBlockIndices = new Set<number>()
-
               try {
                 for await (const message of response) {
                   if (streamClosed) {
@@ -313,44 +316,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                     }
 
                     const event = message.event
-                    const eventType = event.type
-                    const eventIndex = (event as any).index as number | undefined
+                    const eventType = (event as any).type
 
-                    // content block indices are message-scoped; reset skip state per message
-                    if (eventType === "message_start") {
-                      skipBlockIndices.clear()
-                    }
-
-                    // Filter out tool_use content blocks — OpenCode expects text only
-                    if (eventType === "content_block_start") {
-                      const block = (event as any).content_block
-                      if (block?.type === "tool_use") {
-                        if (eventIndex !== undefined) skipBlockIndices.add(eventIndex)
-                        continue
-                      }
-                    }
-
-                    // Skip deltas and stops for tool_use blocks
-                    if (eventIndex !== undefined && skipBlockIndices.has(eventIndex)) {
-                      continue
-                    }
-
-                    // Override message_delta to always show end_turn
-                    if (eventType === "message_delta") {
-                      const patched = {
-                        ...event,
-                        delta: { ...((event as any).delta || {}), stop_reason: "end_turn" },
-                        usage: (event as any).usage || { output_tokens: 0 }
-                      }
-                      const payload = encoder.encode(`event: ${eventType}\ndata: ${JSON.stringify(patched)}\n\n`)
-                      if (!safeEnqueue(payload, `stream_event:${eventType}`)) {
-                        break
-                      }
-                      eventsForwarded += 1
-                      continue
-                    }
-
-                    // Forward all other events (message_start, text deltas, content_block_start/stop for text, message_stop)
+                    // Forward ALL events transparently (including tool_use blocks)
                     const payload = encoder.encode(`event: ${eventType}\ndata: ${JSON.stringify(event)}\n\n`)
                     if (!safeEnqueue(payload, `stream_event:${eventType}`)) {
                       break
