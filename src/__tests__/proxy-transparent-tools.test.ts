@@ -93,7 +93,7 @@ describe("Phase 2: SDK should not use internal tools", () => {
     capturedQueryParams = null
   })
 
-  it("should use maxTurns: 1 so Claude returns tool_use to client", async () => {
+  it("should use maxTurns: 100 for multi-turn tool execution", async () => {
     mockMessages = [
       messageStart(),
       textBlockStart(0),
@@ -108,10 +108,10 @@ describe("Phase 2: SDK should not use internal tools", () => {
     await readStreamFull(response)
 
     expect(capturedQueryParams).toBeDefined()
-    expect(capturedQueryParams.options.maxTurns).toBe(1)
+    expect(capturedQueryParams.options.maxTurns).toBe(100)
   })
 
-  it("should NOT include mcpServers in SDK options", async () => {
+  it("should include MCP tools for internal tool execution", async () => {
     mockMessages = [
       assistantMessage([{ type: "text", text: "Hi" }]),
     ]
@@ -121,10 +121,10 @@ describe("Phase 2: SDK should not use internal tools", () => {
     await response.json()
 
     expect(capturedQueryParams).toBeDefined()
-    expect(capturedQueryParams.options.mcpServers).toBeUndefined()
+    expect(capturedQueryParams.options.mcpServers).toBeDefined()
   })
 
-  it("should NOT include disallowedTools in SDK options", async () => {
+  it("should bypass permissions for automatic tool execution", async () => {
     mockMessages = [
       assistantMessage([{ type: "text", text: "Hi" }]),
     ]
@@ -133,19 +133,8 @@ describe("Phase 2: SDK should not use internal tools", () => {
     const response = await postMessages(app, makeRequest({ stream: false }))
     await response.json()
 
-    expect(capturedQueryParams.options.disallowedTools).toBeUndefined()
-  })
-
-  it("should NOT include allowedTools in SDK options", async () => {
-    mockMessages = [
-      assistantMessage([{ type: "text", text: "Hi" }]),
-    ]
-
-    const app = createTestApp()
-    const response = await postMessages(app, makeRequest({ stream: false }))
-    await response.json()
-
-    expect(capturedQueryParams.options.allowedTools).toBeUndefined()
+    expect(capturedQueryParams.options.permissionMode).toBe("bypassPermissions")
+    expect(capturedQueryParams.options.allowDangerouslySkipPermissions).toBe(true)
   })
 })
 

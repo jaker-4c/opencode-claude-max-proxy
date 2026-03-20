@@ -1,8 +1,6 @@
 import { Hono } from "hono"
 import { cors } from "hono/cors"
 import { query } from "@anthropic-ai/claude-agent-sdk"
-// p-queue removed: with maxTurns: 1, each request is a single API call
-// and concurrent requests (e.g., subagents) must not block each other
 import type { Context } from "hono"
 import type { ProxyConfig } from "./types"
 import { DEFAULT_PROXY_CONFIG } from "./types"
@@ -11,10 +9,11 @@ import { execSync } from "child_process"
 import { existsSync } from "fs"
 import { fileURLToPath } from "url"
 import { join, dirname } from "path"
+import { opencodeMcpServer } from "../mcpTools"
 import { randomUUID } from "crypto"
 import { withClaudeLogContext } from "../logger"
 
-// No request queue — with maxTurns: 1, concurrent requests are safe
+const MCP_SERVER_NAME = "opencode"
 
 function resolveClaudeExecutable(): string {
   // 1. Try the SDK's bundled cli.js (same dir as this module's SDK)
@@ -145,9 +144,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             const response = query({
               prompt,
               options: {
-                maxTurns: 1,
+                maxTurns: 100,
                 model,
                 pathToClaudeCodeExecutable: claudeExecutable,
+                permissionMode: "bypassPermissions",
+                allowDangerouslySkipPermissions: true,
+                mcpServers: {
+                  [MCP_SERVER_NAME]: opencodeMcpServer
+                }
               }
             })
 
@@ -257,10 +261,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               const response = query({
                 prompt,
                 options: {
-                  maxTurns: 1,
+                  maxTurns: 100,
                   model,
                   pathToClaudeCodeExecutable: claudeExecutable,
                   includePartialMessages: true,
+                  permissionMode: "bypassPermissions",
+                  allowDangerouslySkipPermissions: true,
+                  mcpServers: {
+                    [MCP_SERVER_NAME]: opencodeMcpServer
+                  }
                 }
               })
 
