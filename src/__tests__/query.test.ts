@@ -16,6 +16,7 @@ function makeContext(overrides: Partial<QueryContext> = {}): QueryContext {
     stream: false,
     sdkAgents: {},
     cleanEnv: {},
+    hasDeferredTools: false,
     isUndo: false,
     adapter: openCodeAdapter,
     ...overrides,
@@ -53,6 +54,11 @@ describe("buildQueryOptions", () => {
 
   it("sets maxTurns to 3 in passthrough mode with resume (extra turn for session rehydration)", () => {
     const result = buildQueryOptions(makeContext({ passthrough: true, resumeSessionId: "sess-123" }))
+    expect(result.options.maxTurns).toBe(3)
+  })
+
+  it("sets maxTurns to 3 in passthrough mode with deferred tools (extra turn for ToolSearch)", () => {
+    const result = buildQueryOptions(makeContext({ passthrough: true, hasDeferredTools: true }))
     expect(result.options.maxTurns).toBe(3)
   })
 
@@ -158,5 +164,17 @@ describe("buildQueryOptions", () => {
     const hooks = { PreToolUse: [{ matcher: "Task", hooks: [] }] }
     const result = buildQueryOptions(makeContext({ sdkHooks: hooks }))
     expect((result.options as any).hooks).toEqual(hooks)
+  })
+
+  it("sets ENABLE_TOOL_SEARCH=true when hasDeferredTools is true", () => {
+    const result = buildQueryOptions(makeContext({ passthrough: true, hasDeferredTools: true }))
+    const env = (result.options as any).env
+    expect(env.ENABLE_TOOL_SEARCH).toBe("true")
+  })
+
+  it("sets ENABLE_TOOL_SEARCH=false when hasDeferredTools is false", () => {
+    const result = buildQueryOptions(makeContext({ passthrough: true, hasDeferredTools: false }))
+    const env = (result.options as any).env
+    expect(env.ENABLE_TOOL_SEARCH).toBe("false")
   })
 })

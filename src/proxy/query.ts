@@ -31,6 +31,8 @@ export interface QueryContext {
   passthroughMcp?: ReturnType<typeof createPassthroughMcpServer>
   /** Cleaned environment variables (API keys stripped) */
   cleanEnv: Record<string, string | undefined>
+  /** Whether any passthrough tools use deferred loading */
+  hasDeferredTools: boolean
   /** SDK session ID for resume (if continuing a session) */
   resumeSessionId?: string
   /** Whether this is an undo operation */
@@ -66,7 +68,7 @@ export interface BuildQueryResult {
 export function buildQueryOptions(ctx: QueryContext): BuildQueryResult {
   const {
     prompt, model, workingDirectory, systemContext, claudeExecutable,
-    passthrough, stream, sdkAgents, passthroughMcp, cleanEnv,
+    passthrough, stream, sdkAgents, passthroughMcp, cleanEnv, hasDeferredTools,
     resumeSessionId, isUndo, undoRollbackUuid, sdkHooks, adapter, onStderr,
     effort, thinking, taskBudget, betas,
   } = ctx
@@ -90,7 +92,9 @@ export function buildQueryOptions(ctx: QueryContext): BuildQueryResult {
       //         before the response is complete, causing HTTP 500s.
       // On resume: the SDK may spend a turn rehydrating session state before
       // the model responds, so allow 3 turns to prevent "max turns (2)" errors.
-      maxTurns: passthrough ? (resumeSessionId ? 3 : 2) : 200,
+      // With deferred tools: ToolSearch consumes a turn before the actual tool
+      // call, so allow 3 turns to give room for search + call + handoff.
+      maxTurns: passthrough ? ((resumeSessionId || hasDeferredTools) ? 3 : 2) : 200,
       cwd: workingDirectory,
       model,
       pathToClaudeCodeExecutable: claudeExecutable,
@@ -119,7 +123,7 @@ export function buildQueryOptions(ctx: QueryContext): BuildQueryResult {
       ...(onStderr ? { stderr: onStderr } : {}),
       env: {
         ...cleanEnv,
-        ENABLE_TOOL_SEARCH: "false",
+        ENABLE_TOOL_SEARCH: hasDeferredTools ? "true" : "false",
         ...(passthrough ? { ENABLE_CLAUDEAI_MCP_SERVERS: "false" } : {}),
         // When running as root (Docker, Unraid, NAS), set IS_SANDBOX=1 to
         // bypass the SDK's root check. Without this, the SDK exits with:

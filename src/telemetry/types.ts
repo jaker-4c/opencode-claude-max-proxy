@@ -43,6 +43,21 @@ export interface RequestMetric {
    *  - new:          first request, no stored session to compare */
   lineageType?: "continuation" | "compaction" | "undo" | "diverged" | "new"
 
+  /** Whether deferred tool loading was active (auto-defer or client defer_loading) */
+  hasDeferredTools?: boolean
+
+  /** Number of tools deferred (not in prompt, discoverable via ToolSearch) */
+  deferredToolCount?: number
+
+  /** Total number of tools in the request */
+  toolCount?: number
+
+  /** Tool names discovered via ToolSearch this request (deferred tools that got called) */
+  discoveredTools?: string[]
+
+  /** Cumulative count of tools discovered via ToolSearch across the entire session */
+  sessionDiscoveredCount?: number
+
   /** Number of messages in the request */
   messageCount?: number
 

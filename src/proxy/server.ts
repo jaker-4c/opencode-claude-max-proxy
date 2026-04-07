@@ -219,6 +219,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // Restore persisted active profile from last session
   restoreActiveProfile(finalConfig.profiles)
 
+  // Track cumulative discovered tools per SDK session (survives across requests)
+  const sessionDiscoveredTools = new Map<string, Set<string>>()
+
   const app = new Hono()
 
   app.use("*", cors())
@@ -394,7 +397,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         }).join(" → ")
         const lineageType = lineageResult.type === "diverged" && !cachedSession ? "new" : lineageResult.type
         const msgCount = Array.isArray(body.messages) ? body.messages.length : 0
-        const requestLogLine = `${requestMeta.requestId} adapter=${adapter.name} model=${model} stream=${stream} tools=${body.tools?.length ?? 0} lineage=${lineageType} session=${resumeSessionId?.slice(0, 8) || "new"}${isUndo && undoRollbackUuid ? ` rollback=${undoRollbackUuid.slice(0, 8)}` : ""}${agentMode ? ` agent=${agentMode}` : ""} active=${activeSessions}/${MAX_CONCURRENT_SESSIONS} msgCount=${msgCount}`
+        const toolCount = body.tools?.length ?? 0
+        const requestLogLine = `${requestMeta.requestId} adapter=${adapter.name} model=${model} stream=${stream} tools=${toolCount} lineage=${lineageType} session=${resumeSessionId?.slice(0, 8) || "new"}${isUndo && undoRollbackUuid ? ` rollback=${undoRollbackUuid.slice(0, 8)}` : ""}${agentMode ? ` agent=${agentMode}` : ""} active=${activeSessions}/${MAX_CONCURRENT_SESSIONS} msgCount=${msgCount}`
         console.error(`[PROXY] ${requestLogLine} msgs=${msgSummary}`)
         diagnosticLog.session(`${requestLogLine}`, requestMeta.requestId)
 
@@ -582,10 +586,18 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       // can actually call them (not just see them as text descriptions).
       let passthroughMcp: ReturnType<typeof createPassthroughMcpServer> | undefined
       if (passthrough && Array.isArray(body.tools) && body.tools.length > 0) {
-        passthroughMcp = createPassthroughMcpServer(body.tools)
+        passthroughMcp = createPassthroughMcpServer(body.tools, adapter.getCoreToolNames?.())
       }
-
-
+      const hasDeferredTools = passthroughMcp?.hasDeferredTools ?? false
+      // Count deferred tools: when auto-defer is active, non-core tools are deferred
+      const coreNames = adapter.getCoreToolNames?.()
+      const coreSet = coreNames ? new Set(coreNames.map(n => n.toLowerCase())) : undefined
+      const deferredToolCount = hasDeferredTools && Array.isArray(body.tools)
+        ? body.tools.filter((t: any) => t.defer_loading === true || (coreSet && !coreSet.has(String(t.name).toLowerCase()))).length
+        : 0
+      if (hasDeferredTools) {
+        console.error(`[PROXY] ${requestMeta.requestId} deferred=${deferredToolCount}/${toolCount} tools (core: ${coreNames?.join(",") ?? "none"})`)
+      }
 
       // In passthrough mode: block ALL tools, capture them for forwarding (agent-agnostic).
       // In normal mode: delegate hook construction to the adapter.
@@ -595,14 +607,25 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       const trackFileChanges = !(process.env.MERIDIAN_NO_FILE_CHANGES ?? process.env.CLAUDE_PROXY_NO_FILE_CHANGES)
       const fileChangeHook = trackFileChanges ? createFileChangeHook(fileChanges, mcpPrefix) : undefined
 
+      // Track tools discovered via ToolSearch (deferred tools that get called)
+      const discoveredTools = new Set<string>()
+
       const sdkHooks = passthrough
         ? {
             PreToolUse: [{
               matcher: "",  // Match ALL tools
               hooks: [async (input: any) => {
+                // Let the SDK handle ToolSearch internally for deferred tool loading.
+                // ToolSearch is filtered from the response stream below.
+                if (input.tool_name === "ToolSearch") return undefined
+                // Track deferred tools that were discovered via ToolSearch
+                const toolName = stripMcpPrefix(input.tool_name)
+                if (hasDeferredTools && coreSet && !coreSet.has(toolName.toLowerCase())) {
+                  discoveredTools.add(toolName)
+                }
                 capturedToolUses.push({
                   id: input.tool_use_id,
-                  name: stripMcpPrefix(input.tool_name),
+                  name: toolName,
                   input: input.tool_input,
                 })
                 return {
@@ -672,7 +695,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 try {
                   for await (const event of query(buildQueryOptions({
                     prompt: makePrompt(), model, workingDirectory, systemContext, claudeExecutable,
-                    passthrough, stream: false, sdkAgents, passthroughMcp, cleanEnv: profileEnv,
+                    passthrough, stream: false, sdkAgents, passthroughMcp, cleanEnv: profileEnv, hasDeferredTools,
                     resumeSessionId, isUndo, undoRollbackUuid, sdkHooks, adapter, onStderr,
                     effort, thinking, taskBudget, betas,
                   }))) {
@@ -705,7 +728,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     yield* query(buildQueryOptions({
                       prompt: buildFreshPrompt(allMessages, stripCacheControl),
                       model, workingDirectory, systemContext, claudeExecutable,
-                      passthrough, stream: false, sdkAgents, passthroughMcp, cleanEnv: profileEnv,
+                      passthrough, stream: false, sdkAgents, passthroughMcp, cleanEnv: profileEnv, hasDeferredTools,
                       resumeSessionId: undefined, isUndo: false, undoRollbackUuid: undefined, sdkHooks, adapter, onStderr,
                       effort, thinking, taskBudget, betas,
                     }))
@@ -823,6 +846,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 } else {
                   for (const block of message.message.content) {
                     const b = block as unknown as Record<string, unknown>
+                    // Filter ToolSearch from non-streaming passthrough responses
+                    if (b.type === "tool_use" && (b as any).name === "ToolSearch") {
+                      claudeLog("passthrough.toolsearch_filtered", { mode: "non_stream" })
+                      continue
+                    }
                     // Strip thinking blocks — meaningless to non-native clients
                     if (passthrough && !adapter.supportsThinking?.() && (b.type === "thinking" || b.type === "redacted_thinking")) {
                       claudeLog("passthrough.thinking_stripped", { mode: "non_stream", type: b.type })
@@ -848,6 +876,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               durationMs: Date.now() - upstreamStartAt
             })
             if (lastUsage) logUsage(requestMeta.requestId, lastUsage)
+            // Accumulate discovered tools into the session-level set
+            const sessId = currentSessionId || resumeSessionId
+            if (sessId && discoveredTools.size > 0) {
+              if (!sessionDiscoveredTools.has(sessId)) sessionDiscoveredTools.set(sessId, new Set())
+              for (const t of discoveredTools) sessionDiscoveredTools.get(sessId)!.add(t)
+              const newNames = [...discoveredTools].join(", ")
+              const allNames = [...sessionDiscoveredTools.get(sessId)!]
+              console.error(`[PROXY] ${requestMeta.requestId} discovered=${discoveredTools.size} (${newNames}) session_total=${allNames.length}`)
+            }
           } catch (error) {
             const stderrOutput = stderrLines.join("\n").trim()
             if (stderrOutput && error instanceof Error && !error.message.includes(stderrOutput)) {
@@ -943,6 +980,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             mode: "non-stream",
             isResume,
             isPassthrough: passthrough,
+            hasDeferredTools,
+            deferredToolCount: hasDeferredTools ? deferredToolCount : undefined,
+            toolCount,
+            discoveredTools: discoveredTools.size > 0 ? [...discoveredTools] : undefined,
+            sessionDiscoveredCount: sessionDiscoveredTools.get(currentSessionId || resumeSessionId || "")?.size,
             lineageType,
             messageCount: allMessages.length,
             sdkSessionId: currentSessionId || resumeSessionId,
@@ -1051,7 +1093,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   try {
                     for await (const event of query(buildQueryOptions({
                       prompt: makePrompt(), model, workingDirectory, systemContext, claudeExecutable,
-                      passthrough, stream: true, sdkAgents, passthroughMcp, cleanEnv: profileEnv,
+                      passthrough, stream: true, sdkAgents, passthroughMcp, cleanEnv: profileEnv, hasDeferredTools,
                       resumeSessionId, isUndo, undoRollbackUuid, sdkHooks, adapter, onStderr,
                       effort, thinking, taskBudget, betas,
                     }))) {
@@ -1081,7 +1123,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       yield* query(buildQueryOptions({
                         prompt: buildFreshPrompt(allMessages, stripCacheControl),
                         model, workingDirectory, systemContext, claudeExecutable,
-                        passthrough, stream: true, sdkAgents, passthroughMcp, cleanEnv: profileEnv,
+                        passthrough, stream: true, sdkAgents, passthroughMcp, cleanEnv: profileEnv, hasDeferredTools,
                         resumeSessionId: undefined, isUndo: false, undoRollbackUuid: undefined, sdkHooks, adapter, onStderr,
                         effort, thinking, taskBudget, betas,
                       }))
@@ -1262,6 +1304,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                         continue
                       }
                       if (block?.type === "tool_use" && typeof block.name === "string") {
+                        // Filter out ToolSearch — handled internally by the SDK
+                        // for deferred tool loading, not visible to the client.
+                        if (block.name === "ToolSearch") {
+                          if (eventIndex !== undefined) skipBlockIndices.add(eventIndex)
+                          continue
+                        }
                         if (passthrough && block.name.startsWith(PASSTHROUGH_MCP_PREFIX)) {
                           // Passthrough mode: SDK sent the name WITH the mcp__oc__ prefix.
                           // Strip it so OpenCode sees the bare tool name.
@@ -1355,6 +1403,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 textEventsForwarded
               })
               if (lastUsage) logUsage(requestMeta.requestId, lastUsage)
+              // Accumulate discovered tools into the session-level set
+              const sessId = currentSessionId || resumeSessionId
+              if (sessId && discoveredTools.size > 0) {
+                if (!sessionDiscoveredTools.has(sessId)) sessionDiscoveredTools.set(sessId, new Set())
+                for (const t of discoveredTools) sessionDiscoveredTools.get(sessId)!.add(t)
+                const newNames = [...discoveredTools].join(", ")
+                const allNames = [...sessionDiscoveredTools.get(sessId)!]
+                console.error(`[PROXY] ${requestMeta.requestId} discovered=${discoveredTools.size} (${newNames}) session_total=${allNames.length}`)
+              }
 
               // Store session for future resume
               if (currentSessionId) {
@@ -1496,6 +1553,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   mode: "stream",
                   isResume,
                   isPassthrough: passthrough,
+                  hasDeferredTools,
+                  deferredToolCount: hasDeferredTools ? deferredToolCount : undefined,
+                  toolCount,
+                  discoveredTools: discoveredTools.size > 0 ? [...discoveredTools] : undefined,
+            sessionDiscoveredCount: sessionDiscoveredTools.get(currentSessionId || resumeSessionId || "")?.size,
                   lineageType,
                   messageCount: allMessages.length,
                   sdkSessionId: currentSessionId || resumeSessionId,
@@ -1612,6 +1674,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           mode: "non-stream",
           isResume: false,
           isPassthrough: envBool("PASSTHROUGH"),
+          hasDeferredTools: undefined,
+          deferredToolCount: undefined,
+          toolCount: undefined,
           lineageType: undefined,
           messageCount: undefined,
           sdkSessionId: undefined,
